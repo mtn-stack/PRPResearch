@@ -1,4 +1,4 @@
-name: Daily URA Residential Transaction Fetch
+name: Daily URA Residential Fetch
 
 on:
   schedule:

@@ -13,29 +13,9 @@ TOKEN_URL = "https://eservice.ura.gov.sg/uraDataService/insertNewToken/v1"
 DATA_URL = "https://eservice.ura.gov.sg/uraDataService/invokeUraDS/v1"
 
 DATA_FOLDER = "data"
-YEARS_TO_FETCH = [2021, 2022, 2023, 2024, 2025, 2026]
 
-RESIDENTIAL_KEYWORDS = [
-    "residential",
-    "dwelling",
-    "dwelling house",
-    "terrace",
-    "terrace house",
-    "landed",
-    "landed housing",
-    "housing",
-    "apartment",
-    "condominium",
-    "flat",
-    "bungalow",
-    "semi-detached",
-    "detached",
-    "attic",
-    "good class bungalow",
-    "cluster housing",
-    "strata landed",
-    "serviced apartment",
-]
+# URA private residential transactions are usually split into batches.
+BATCHES = [1, 2, 3, 4]
 
 
 def get_token() -> str:
@@ -61,12 +41,15 @@ def get_token() -> str:
     return data["Result"].strip()
 
 
-def fetch_planning_decisions(token: str, year: int) -> List[Dict[str, Any]]:
+def fetch_private_residential_transactions(
+    token: str,
+    batch: int,
+) -> List[Dict[str, Any]]:
     response = requests.get(
         DATA_URL,
         params={
-            "service": "Planning_Decision",
-            "year": str(year),
+            "service": "PMI_Resi_Transaction",
+            "batch": str(batch),
         },
         headers={
             "AccessKey": ACCESS_KEY,
@@ -74,7 +57,7 @@ def fetch_planning_decisions(token: str, year: int) -> List[Dict[str, Any]]:
             "Accept": "application/json",
             "User-Agent": "Mozilla/5.0",
         },
-        timeout=60,
+        timeout=90,
     )
 
     response.raise_for_status()
@@ -86,19 +69,38 @@ def fetch_planning_decisions(token: str, year: int) -> List[Dict[str, Any]]:
     data = response.json()
 
     if data.get("Status") != "Success":
-        raise RuntimeError(f"URA request failed: {data}")
+        raise RuntimeError(f"URA request failed for batch {batch}: {data}")
 
     return data.get("Result", [])
 
 
-def is_residential(record: Dict[str, Any]) -> bool:
-    text = " ".join(
-        str(value).lower()
-        for value in record.values()
-        if value is not None
-    )
+def flatten_transactions(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows = []
 
-    return any(keyword in text for keyword in RESIDENTIAL_KEYWORDS)
+    for project_record in records:
+        transactions = project_record.get("transaction", [])
+
+        project_info = {
+            key: value
+            for key, value in project_record.items()
+            if key != "transaction"
+        }
+
+        if not transactions:
+            rows.append(project_info)
+            continue
+
+        for transaction in transactions:
+            row = {}
+
+            row.update(project_info)
+
+            for key, value in transaction.items():
+                row[key] = value
+
+            rows.append(row)
+
+    return rows
 
 
 def save_csv(records: List[Dict[str, Any]], filepath: str) -> None:
@@ -127,44 +129,41 @@ def main() -> None:
     print("Generating URA token...")
     token = get_token()
 
-    all_records = []
-    residential_records = []
+    raw_records = []
 
-    for year in YEARS_TO_FETCH:
-        print(f"Fetching {year}...")
-        records = fetch_planning_decisions(token, year)
+    for batch in BATCHES:
+        print(f"Fetching private residential transactions batch {batch}...")
+        batch_records = fetch_private_residential_transactions(token, batch)
+        print(f"Batch {batch}: {len(batch_records)} project records")
+        raw_records.extend(batch_records)
 
-        all_records.extend(records)
-        residential_records.extend(
-            record for record in records
-            if is_residential(record)
-        )
+    flat_records = flatten_transactions(raw_records)
 
-    print(f"Total records: {len(all_records)}")
-    print(f"Residential records: {len(residential_records)}")
+    print(f"Total project records: {len(raw_records)}")
+    print(f"Total flattened transaction rows: {len(flat_records)}")
 
-    csv_path = os.path.join(
+    latest_csv = os.path.join(
         DATA_FOLDER,
-        f"ura_residential_planning_decisions_{timestamp}.csv",
+        "ura_private_residential_transactions_latest.csv",
     )
 
-    latest_csv_path = os.path.join(
+    dated_csv = os.path.join(
         DATA_FOLDER,
-        "ura_residential_planning_decisions_latest.csv",
+        f"ura_private_residential_transactions_{timestamp}.csv",
     )
 
-    json_path = os.path.join(
+    dated_json = os.path.join(
         DATA_FOLDER,
-        f"ura_residential_planning_decisions_{timestamp}.json",
+        f"ura_private_residential_transactions_{timestamp}.json",
     )
 
-    save_csv(residential_records, csv_path)
-    save_csv(residential_records, latest_csv_path)
-    save_json(residential_records, json_path)
+    save_csv(flat_records, latest_csv)
+    save_csv(flat_records, dated_csv)
+    save_json(raw_records, dated_json)
 
-    print(f"Saved: {csv_path}")
-    print(f"Saved: {latest_csv_path}")
-    print(f"Saved: {json_path}")
+    print(f"Saved: {latest_csv}")
+    print(f"Saved: {dated_csv}")
+    print(f"Saved: {dated_json}")
 
 
 if __name__ == "__main__":

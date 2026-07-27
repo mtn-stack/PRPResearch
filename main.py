@@ -14,8 +14,34 @@ DATA_URL = "https://eservice.ura.gov.sg/uraDataService/invokeUraDS/v1"
 
 DATA_FOLDER = "data"
 
-# URA private residential transactions are usually split into batches.
-BATCHES = [1, 2, 3, 4]
+SERVICES = {
+    "private_residential_transactions": {
+        "service": "PMI_Resi_Transaction",
+        "param_sets": [{"batch": str(i)} for i in range(1, 5)],
+    },
+    "private_residential_rental_contracts": {
+        "service": "PMI_Resi_Rental",
+        # Update these if you want more/other quarters
+        "param_sets": [
+            {"refPeriod": "26q2"},
+            {"refPeriod": "26q1"},
+            {"refPeriod": "25q4"},
+            {"refPeriod": "25q3"},
+        ],
+    },
+    "private_residential_median_rentals": {
+        "service": "PMI_Resi_Rental_Median",
+        "param_sets": [{}],
+    },
+    "private_residential_developer_sales": {
+        "service": "PMI_Resi_Developer_Sales",
+        "param_sets": [{}],
+    },
+    "private_residential_pipeline": {
+        "service": "PMI_Resi_Pipeline",
+        "param_sets": [{}],
+    },
+}
 
 
 def get_token() -> str:
@@ -41,71 +67,79 @@ def get_token() -> str:
     return data["Result"].strip()
 
 
-def fetch_private_residential_transactions(
-    token: str,
-    batch: int,
-) -> List[Dict[str, Any]]:
+def fetch_service(token: str, service: str, extra_params: Dict[str, str]) -> List[Dict[str, Any]]:
+    params = {"service": service}
+    params.update(extra_params)
+
     response = requests.get(
         DATA_URL,
-        params={
-            "service": "PMI_Resi_Transaction",
-            "batch": str(batch),
-        },
+        params=params,
         headers={
             "AccessKey": ACCESS_KEY,
             "Token": token,
             "Accept": "application/json",
             "User-Agent": "Mozilla/5.0",
         },
-        timeout=90,
+        timeout=120,
     )
 
     response.raise_for_status()
 
     text = response.text.strip()
     if text.startswith("<!DOCTYPE html>") or "<html" in text.lower():
-        raise RuntimeError("URA returned HTML instead of JSON.")
+        raise RuntimeError(f"{service} returned HTML instead of JSON.")
 
     data = response.json()
 
     if data.get("Status") != "Success":
-        raise RuntimeError(f"URA request failed for batch {batch}: {data}")
+        raise RuntimeError(f"{service} failed: {data}")
 
     return data.get("Result", [])
 
 
-def flatten_transactions(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows = []
+def flatten_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    flattened = []
 
-    for project_record in records:
-        transactions = project_record.get("transaction", [])
-
-        project_info = {
+    for record in records:
+        nested_lists = {
             key: value
-            for key, value in project_record.items()
-            if key != "transaction"
+            for key, value in record.items()
+            if isinstance(value, list)
         }
 
-        if not transactions:
-            rows.append(project_info)
+        base = {
+            key: value
+            for key, value in record.items()
+            if not isinstance(value, list)
+        }
+
+        if not nested_lists:
+            flattened.append(base)
             continue
 
-        for transaction in transactions:
-            row = {}
+        for nested_key, nested_values in nested_lists.items():
+            for item in nested_values:
+                row = dict(base)
 
-            row.update(project_info)
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        row[key] = value
+                else:
+                    row[nested_key] = item
 
-            for key, value in transaction.items():
-                row[key] = value
+                flattened.append(row)
 
-            rows.append(row)
+    return flattened
 
-    return rows
+
+def save_json(records: Any, filepath: str) -> None:
+    with open(filepath, "w", encoding="utf-8") as file:
+        json.dump(records, file, indent=2, ensure_ascii=False)
 
 
 def save_csv(records: List[Dict[str, Any]], filepath: str) -> None:
     if not records:
-        print(f"No records to save: {filepath}")
+        print(f"No CSV records to save: {filepath}")
         return
 
     fieldnames = sorted({key for record in records for key in record.keys()})
@@ -116,11 +150,6 @@ def save_csv(records: List[Dict[str, Any]], filepath: str) -> None:
         writer.writerows(records)
 
 
-def save_json(records: List[Dict[str, Any]], filepath: str) -> None:
-    with open(filepath, "w", encoding="utf-8") as file:
-        json.dump(records, file, indent=2, ensure_ascii=False)
-
-
 def main() -> None:
     os.makedirs(DATA_FOLDER, exist_ok=True)
 
@@ -129,41 +158,41 @@ def main() -> None:
     print("Generating URA token...")
     token = get_token()
 
-    raw_records = []
+    for output_name, config in SERVICES.items():
+        service = config["service"]
+        param_sets = config["param_sets"]
 
-    for batch in BATCHES:
-        print(f"Fetching private residential transactions batch {batch}...")
-        batch_records = fetch_private_residential_transactions(token, batch)
-        print(f"Batch {batch}: {len(batch_records)} project records")
-        raw_records.extend(batch_records)
+        print(f"\nFetching {output_name}...")
 
-    flat_records = flatten_transactions(raw_records)
+        raw_records = []
 
-    print(f"Total project records: {len(raw_records)}")
-    print(f"Total flattened transaction rows: {len(flat_records)}")
+        for params in param_sets:
+            print(f"  Service={service}, params={params}")
 
-    latest_csv = os.path.join(
-        DATA_FOLDER,
-        "ura_private_residential_transactions_latest.csv",
-    )
+            try:
+                records = fetch_service(token, service, params)
+                print(f"  Received {len(records)} records")
+                raw_records.extend(records)
+            except Exception as error:
+                print(f"  Failed: {error}")
 
-    dated_csv = os.path.join(
-        DATA_FOLDER,
-        f"ura_private_residential_transactions_{timestamp}.csv",
-    )
+        flat_records = flatten_records(raw_records)
 
-    dated_json = os.path.join(
-        DATA_FOLDER,
-        f"ura_private_residential_transactions_{timestamp}.json",
-    )
+        latest_json = os.path.join(DATA_FOLDER, f"{output_name}_latest.json")
+        dated_json = os.path.join(DATA_FOLDER, f"{output_name}_{timestamp}.json")
 
-    save_csv(flat_records, latest_csv)
-    save_csv(flat_records, dated_csv)
-    save_json(raw_records, dated_json)
+        latest_csv = os.path.join(DATA_FOLDER, f"{output_name}_latest.csv")
+        dated_csv = os.path.join(DATA_FOLDER, f"{output_name}_{timestamp}.csv")
 
-    print(f"Saved: {latest_csv}")
-    print(f"Saved: {dated_csv}")
-    print(f"Saved: {dated_json}")
+        save_json(raw_records, latest_json)
+        save_json(raw_records, dated_json)
+
+        save_csv(flat_records, latest_csv)
+        save_csv(flat_records, dated_csv)
+
+        print(f"Saved {output_name}: {len(flat_records)} CSV rows")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
